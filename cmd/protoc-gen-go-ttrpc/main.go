@@ -18,12 +18,14 @@ package main
 
 import (
 	"google.golang.org/protobuf/compiler/protogen"
+	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/pluginpb"
 )
 
 func main() {
 	var servicePrefix string
 	protogen.Options{
+	
 		ParamFunc: func(name, value string) error {
 			if name == "prefix" {
 				servicePrefix = value
@@ -31,7 +33,10 @@ func main() {
 			return nil
 		},
 	}.Run(func(gen *protogen.Plugin) error {
+		gen.SupportedEditionsMinimum = descriptorpb.Edition_EDITION_2023
+		gen.SupportedEditionsMaximum = descriptorpb.Edition_EDITION_2023
 		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_PROTO3_OPTIONAL)
+		gen.SupportedFeatures = uint64(pluginpb.CodeGeneratorResponse_FEATURE_SUPPORTS_EDITIONS)
 		for _, f := range gen.Files {
 			if !f.Generate {
 				continue
