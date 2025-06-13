@@ -24,6 +24,7 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+	debugging   bool
 }
 
 // ServerOpt for configuring a ttrpc server
@@ -82,5 +83,12 @@ func chainUnaryServerInterceptors(info *UnaryServerInfo, method Method, intercep
 	return func(ctx context.Context, unmarshal func(interface{}) error) (interface{}, error) {
 		return interceptors[0](ctx, unmarshal, info,
 			chainUnaryServerInterceptors(info, method, interceptors[1:]))
+	}
+}
+
+func WithServerDebugging() ServerOpt {
+	return func(c *serverConfig) error {
+		c.debugging = true
+		return nil
 	}
 }

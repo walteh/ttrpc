@@ -24,6 +24,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,8 +49,10 @@ type Client struct {
 	closed func()
 
 	closeOnce       sync.Once
-	userCloseFunc   func()
+	userCloseFunc   func(error)
 	userCloseWaitCh chan struct{}
+
+	debugging bool
 
 	interceptor UnaryClientInterceptor
 }
@@ -59,6 +62,21 @@ type ClientOpts func(c *Client)
 
 // WithOnClose sets the close func whenever the client's Close() method is called
 func WithOnClose(onClose func()) ClientOpts {
+	return func(c *Client) {
+		c.userCloseFunc = func(err error) {
+			onClose()
+		}
+	}
+}
+
+// WithDebugging enables debugging for the client
+func WithClientDebugging() ClientOpts {
+	return func(c *Client) {
+		c.debugging = true
+	}
+}
+
+func WithOnCloseError(onClose func(error)) ClientOpts {
 	return func(c *Client) {
 		c.userCloseFunc = onClose
 	}
@@ -119,7 +137,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		nextStreamID:    1,
 		closed:          cancel,
 		ctx:             ctx,
-		userCloseFunc:   func() {},
+		userCloseFunc:   func(error) {},
 		userCloseWaitCh: make(chan struct{}),
 	}
 
@@ -140,6 +158,8 @@ func (c *Client) send(sid uint32, mt messageType, flags uint8, b []byte) error {
 	defer c.sendLock.Unlock()
 	return c.channel.send(sid, mt, flags, b)
 }
+
+var id atomic.Uint64 = atomic.Uint64{}
 
 // Call makes a unary request and returns with response
 func (c *Client) Call(ctx context.Context, service, method string, req, resp interface{}) error {
@@ -167,20 +187,66 @@ func (c *Client) Call(ctx context.Context, service, method string, req, resp int
 		creq.TimeoutNano = time.Until(dl).Nanoseconds()
 	}
 
+	id := id.Add(1)
+
+	start := time.Now()
+
+	if c.debugging {
+		log.G(ctx).
+			WithField("deadline", time.Duration(creq.TimeoutNano).String()).
+			WithField("service", service).
+			WithField("method", method).
+			WithField("id", id).
+			Debug("ttrpc client: call started")
+	}
+
 	info := &UnaryClientInfo{
 		FullMethod: fullPath(service, method),
 	}
-	if err := c.interceptor(ctx, creq, cresp, info, c.dispatch); err != nil {
+	if err = c.interceptor(ctx, creq, cresp, info, c.dispatch); err != nil {
+		if c.debugging && !errors.Is(err, context.Canceled) {
+			log.G(ctx).
+				WithField("error", err).
+				WithField("errorFuncName", "interceptor").
+				WithField("id", id).
+				WithField("duration", time.Since(start).String()).
+				Warn("ttrpc client: call completed")
+		}
 		return err
 	}
 
-	if err := c.codec.Unmarshal(cresp.Payload, resp); err != nil {
+	if err = c.codec.Unmarshal(cresp.Payload, resp); err != nil {
+		if c.debugging && !errors.Is(err, context.Canceled) {
+			log.G(ctx).
+				WithField("error", err).
+				WithField("errorFuncName", "unmarshal").
+				WithField("id", id).
+				WithField("duration", time.Since(start).String()).
+				Warn("ttrpc client: call completed")
+		}
 		return err
 	}
 
 	if cresp.Status != nil && cresp.Status.Code != int32(codes.OK) {
-		return status.ErrorProto(cresp.Status)
+		if c.debugging && !errors.Is(err, context.Canceled) {
+			log.G(ctx).
+				WithField("error", cresp.Status).
+				WithField("errorFuncName", "status error").
+				WithField("id", id).
+				WithField("duration", time.Since(start).String()).
+				Warn("ttrpc client: call completed")
+		}
+		err = status.ErrorProto(cresp.Status)
+		return err
 	}
+
+	if c.debugging {
+		log.G(ctx).
+			WithField("id", id).
+			WithField("duration", time.Since(start).String()).
+			Debug("ttrpc client: call completed")
+	}
+
 	return nil
 }
 
@@ -216,7 +282,7 @@ func (cs *clientStream) CloseSend() error {
 	}
 	err := cs.s.send(messageTypeData, flagRemoteClosed|flagNoData, nil)
 	if err != nil {
-		return filterCloseErr(err)
+		return filterCloseErr(cs.ctx, err)
 	}
 	cs.localClosed = true
 	return nil
@@ -243,7 +309,7 @@ func (cs *clientStream) SendMsg(m interface{}) error {
 
 	err = cs.s.send(messageTypeData, 0, payload)
 	if err != nil {
-		return filterCloseErr(err)
+		return filterCloseErr(cs.ctx, err)
 	}
 
 	return nil
@@ -341,7 +407,7 @@ func (c *Client) run() {
 	c.Close()
 	c.cleanupStreams(err)
 
-	c.userCloseFunc()
+	c.userCloseFunc(err)
 	close(c.userCloseWaitCh)
 }
 
@@ -349,6 +415,7 @@ func (c *Client) receiveLoop() error {
 	for {
 		select {
 		case <-c.ctx.Done():
+			log.G(c.ctx).Error("ttrpc: connection closed - context done")
 			return ErrClosed
 		default:
 			var (
@@ -362,7 +429,7 @@ func (c *Client) receiveLoop() error {
 				if !ok {
 					// treat all errors that are not an rpc status as terminal.
 					// all others poison the connection.
-					return filterCloseErr(err)
+					return filterCloseErr(c.ctx, err)
 				}
 			}
 			sid := streamID(msg.header.StreamID)
@@ -398,6 +465,7 @@ func (c *Client) createStream(flags uint8, b []byte) (*stream, error) {
 	// anything after cleanup completes
 	select {
 	case <-c.ctx.Done():
+		log.G(c.ctx).Error("ttrpc: connection closed - context done")
 		return nil, ErrClosed
 	default:
 	}
@@ -412,6 +480,7 @@ func (c *Client) createStream(flags uint8, b []byte) (*stream, error) {
 		// anything after cleanup completes
 		select {
 		case <-c.ctx.Done():
+			log.G(c.ctx).Error("ttrpc: connection closed - context done")
 			return ErrClosed
 		default:
 		}
@@ -426,7 +495,7 @@ func (c *Client) createStream(flags uint8, b []byte) (*stream, error) {
 	}
 
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
-		return s, filterCloseErr(err)
+		return s, filterCloseErr(c.ctx, err)
 	}
 
 	return s, nil
@@ -460,17 +529,24 @@ func (c *Client) cleanupStreams(err error) {
 // returning from call or handling errors from main read loop.
 //
 // This purposely ignores errors with a wrapped cause.
-func filterCloseErr(err error) error {
+func filterCloseErr(ctx context.Context, err error) error {
+	logit := func(err error) {
+		log.G(ctx).WithField("error", err).Error("ignoring wrapped close error")
+	}
 	switch {
 	case err == nil:
 		return nil
 	case err == io.EOF:
+		logit(err)
 		return ErrClosed
 	case errors.Is(err, io.ErrClosedPipe):
+		logit(err)
 		return ErrClosed
 	case errors.Is(err, io.EOF):
+		logit(err)
 		return ErrClosed
 	case strings.Contains(err.Error(), "use of closed network connection"):
+		logit(err)
 		return ErrClosed
 	default:
 		// if we have an epipe on a write or econnreset on a read , we cast to errclosed
@@ -478,6 +554,7 @@ func filterCloseErr(err error) error {
 		if errors.As(err, &oerr) {
 			if (oerr.Op == "write" && errors.Is(err, syscall.EPIPE)) ||
 				(oerr.Op == "read" && errors.Is(err, syscall.ECONNRESET)) {
+				logit(err)
 				return ErrClosed
 			}
 		}

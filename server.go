@@ -69,6 +69,10 @@ func (s *Server) Register(name string, methods map[string]Method) {
 	s.services.register(name, &ServiceDesc{Methods: methods})
 }
 
+func (s *Server) SetDebugging(debugging bool) {
+	s.config.debugging = debugging
+}
+
 func (s *Server) RegisterService(name string, desc *ServiceDesc) {
 	s.services.register(name, desc)
 }
@@ -416,6 +420,16 @@ func (c *serverConn) run(sctx context.Context) {
 						return
 					}
 				}
+				if i == nil {
+					if c.server.config.debugging {
+						log.G(ctx).WithFields(log.Fields{
+							"streamID": mh.StreamID,
+							"type":     mh.Type,
+							"flags":    mh.Flags,
+						}).Info("ttrpc server: received data for closed stream")
+					}
+					return
+				}
 				sh := i.(*streamHandler)
 				if mh.Flags&flagNoData != flagNoData {
 					unmarshal := func(obj interface{}) error {
@@ -450,6 +464,14 @@ func (c *serverConn) run(sctx context.Context) {
 				}
 				lastStreamID = mh.StreamID
 
+				if c.server.config.debugging {
+					log.G(ctx).WithFields(log.Fields{
+						"streamID": mh.StreamID,
+						"type":     mh.Type,
+						"flags":    mh.Flags,
+					}).Info("ttrpc server: received request")
+				}
+
 				// TODO: Make request type configurable
 				// Unmarshaller which takes in a byte array and returns an interface?
 				var req Request
@@ -472,6 +494,7 @@ func (c *serverConn) run(sctx context.Context) {
 						closeStream: closeStream,
 						streaming:   streaming,
 					}:
+
 					case <-done:
 						return ErrClosed
 					}
@@ -479,6 +502,12 @@ func (c *serverConn) run(sctx context.Context) {
 				}
 				sh, err := c.server.services.handle(ctx, &req, respond)
 				if err != nil {
+					if c.server.config.debugging {
+						log.G(ctx).WithFields(log.Fields{
+							"streamID": id,
+							"error":    err,
+						}).Error("ttrpc server: error handling request")
+					}
 					status, _ := status.FromError(err)
 					if !sendStatus(mh.StreamID, status) {
 						return
